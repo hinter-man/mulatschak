@@ -1,6 +1,6 @@
 const MAX_PLAYERS = 4;
-let player = require('./Player');
-let deck = require('./Deck'); // used for generating random order no
+const Player = require('./Player').Player;
+const deck = require('./Deck'); // used for generating random order no
 
 class Room {
 
@@ -15,6 +15,9 @@ class Room {
         this.playedCards = new Map(); // temp map for player and played cards in round
         this.deck = [];
         this.round = 0;
+        this.phase = 'waiting';
+        this.biddingTurnNo = 0;
+        this.winningBidderSocketId = null;
     }
 
     addPlayer(id, roomId, name) {
@@ -22,9 +25,10 @@ class Room {
             return false;
         }
 
-        this.players.push(new player.Player(id, roomId, name));
+        this.players.push(new Player(id, roomId, name));
         this.amountOfPlayers = this.players.length;
         this.availableSeats = (this.amountOfPlayers < MAX_PLAYERS); // max 4 players in one room
+        return true;
     }
 
     removePlayer(socketId) {
@@ -60,7 +64,7 @@ class Room {
     }
 
     getSocketIdWithHighestTrickCall() {
-        var maxTrickCallPlayer = this.players.sort(compareByTrickCall)[0];
+        var maxTrickCallPlayer = this.players.slice().sort(compareByTrickCall)[0];
         
         this.players.forEach(p => {
             if (p.socketId !== maxTrickCallPlayer.socketId) {
@@ -106,17 +110,14 @@ class Room {
     setWeliAsTrump(trump) {
         // either search weli in deck or in players hand
         var weli = this.deck.find(card => card.id === 'weli');
-        var indexOfWeli = -1;
         if (weli) { // deck
-            indexOfWeli = this.deck.indexOf(weli);
-            this.deck[indexOfWeli].color = trump;
+            weli.color = trump;
             return true;
         } else { // players hand
             for (let i = 0; i < this.players.length; i++) {
                 weli = this.players[i].hand.find(card => card.id === 'weli');
                 if (weli) {
-                    indexOfWeli = this.players[i].hand.indexOf(weli);
-                    this.players[i].hand[indexOfWeli].color = trump;
+                    weli.color = trump;
                     return true;
                 }
             }
@@ -138,10 +139,10 @@ class Room {
         }
         // increases trumps in players hand
         for (let i = 0; i < this.players.length; i++) {
-            player = this.players[i];
-            for (let j = 0; j < player.hand.length; j++) {
-                if (player.hand[j].color === trump) {
-                    player.hand[j].cardRank += 10;
+            const currentPlayer = this.players[i];
+            for (let j = 0; j < currentPlayer.hand.length; j++) {
+                if (currentPlayer.hand[j].color === trump) {
+                    currentPlayer.hand[j].cardRank += 10;
                 }
             }
         }
@@ -161,6 +162,11 @@ class Room {
         this.trump = '';
         this.turnNo = 0;
         this.round = 0;
+        this.phase = 'waiting';
+        this.biddingTurnNo = 0;
+        this.winningBidderSocketId = null;
+        this.deck = [];
+        this.playedCards.clear();
 
         for (let i = 0; i < this.players.length; i++) {
             const player = this.players[i];
