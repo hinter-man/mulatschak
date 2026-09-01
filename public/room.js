@@ -1,7 +1,5 @@
 //#region globals
 var socket = io('/room'); // io in namespace room
-var params = {};
-
 var svgNamespace = 'http://www.w3.org/2000/svg';
 var svgXlink = 'http://www.w3.org/1999/xlink';
 
@@ -22,24 +20,18 @@ $(window).ready(function () {
     // register some click listeners
     registerClickListeners();
 
-    //readyBtn.onclick = setReadyBtn;
-    if (location.search) {
-        var parts = location.search.substring(1).split('&');
-
-        for (var i = 0; i < parts.length; i++) {
-            var nv = parts[i].split('=');
-            if (!nv[0]) continue;
-            params[nv[0]] = decodeURIComponent(nv[1]) || true;
-        }
-    }
-
-    roomId = params.id;
+    var params = new URLSearchParams(location.search);
+    roomId = params.get('id');
 
     // client sends room and username in which he wants to join
-    socket.emit('join-room', JSON.stringify({
-        roomId: params.id,
-        username: params.username
-    }));
+    socket.emit('join-room', {
+        roomId: roomId,
+        username: params.get('username')
+    }, function (result) {
+        if (!result.ok) {
+            window.location.href = './index.html';
+        }
+    });
 
     socket.on('update-player-list', function (data) {
         updatePlayerList(data);
@@ -107,19 +99,28 @@ $(window).ready(function () {
         $('#end-view').fadeIn();
     });
 
+    socket.on('game-aborted', function (message) {
+        alert(message);
+        actualPlayer = undefined;
+        clearHand();
+        updatePlayedCards(undefined);
+        displayTrump(undefined);
+        updatePlayerTrickCalls();
+        $('.modal').modal('hide');
+        $('#end-view').hide();
+        $('#start-view').fadeIn();
+    });
+
+    socket.on('game-error', function (error) {
+        console.warn(error.message);
+    });
+
 });
 
 $(window).on('beforeunload', function () {
     return confirm('Do you really want to close?');
 });
 
-$(window).on('unload', function () {
-    // disconnect with roomId 
-    if (actualPlayer) {
-        socket.emit('force-disconnect', params.id);
-    }
-
-});
 //#endregion window
 
 //#region room functions
@@ -127,42 +128,38 @@ function updatePlayerList(room) {
     var players = room.players;
     var actualTurnNo = room.turnNo;
 
-    var html = '';
-    var thClass = '';
+    var playerNames = document.getElementById('player-names');
+    playerNames.textContent = '';
 
     // player names are table headers
     players.forEach(player => {
         if (player.ready) {
+            var playerName = document.createElement('th');
+            playerName.textContent = player.name;
             if (player.order === (actualTurnNo) && player.order !== 0) {
-                thClass = 'class="bg-danger"';
-            } else {
-                thClass = '';
+                playerName.className = 'bg-danger';
             }
-            html += '<th ' + thClass + '>' + player.name + '</th>';
+            playerNames.appendChild(playerName);
         }
     });
-    $('#player-names').html(html);
 }
 
 function updatePoints(room) {
 
-    var playerPoints = $('#player-points');
-
-    // players points are table data
-    var html = playerPoints.html();
-    html += '<tr>';
+    var playerPoints = document.getElementById('player-points');
+    var pointsRow = document.createElement('tr');
     room.players.forEach(player => {
-        html += '<td>' + player.points + '</td>';
+        var points = document.createElement('td');
+        points.textContent = player.points;
+        pointsRow.appendChild(points);
     });
-    html += '</tr>';
-    playerPoints.html(html);
-
+    playerPoints.appendChild(pointsRow);
 }
 
 function updateRoomData(room) {
 
     document.title = room.id + ': ' + room.name; 
-    $('#room-h1').html(room.name);
+    $('#room-h1').text(room.name);
 
 }
 
@@ -200,33 +197,31 @@ function registerClickListeners() {
     document.getElementById('choose-trump-color_schelle').onclick = setTrump;
 
     $('#start-view').click(function () {
-        socket.emit('set-ready', params.id);
+        socket.emit('set-ready');
         $(this).fadeOut();
     });
 
     $('#end-view').click(function () {
-        socket.emit('set-ready', params.id);
+        socket.emit('set-ready');
         $(this).fadeOut();
     });
 
 }
 
 function updatePlayerTrickCalls(players) {
-    var playerTrickCalls = $('#player-trick-calls');
-
-    // players trick call in round
-    var html = '';
+    var playerTrickCalls = document.getElementById('player-trick-calls');
+    playerTrickCalls.textContent = '';
     if (players) {
-
         players.forEach(player => {
+            var trickCall = document.createElement('td');
             if (player.trickCall != 0) {
-                html += '<td>' + player.trickCalls + '/' + player.trickCall + '</td>';
+                trickCall.textContent = player.trickCalls + '/' + player.trickCall;
             } else {
-                html += '<td>' + player.trickCalls + '</td>';
+                trickCall.textContent = player.trickCalls;
             }
+            playerTrickCalls.appendChild(trickCall);
         });
     }
-    playerTrickCalls.html(html);
 }
 
 //#endregion room functions
@@ -242,11 +237,7 @@ function startRound() {
 }
 
 function handoutCards() {
-
-    // clean cards before handout
-    while (cards.firstChild) {
-        cards.removeChild(cards.firstChild);
-    }
+    clearHand();
 
     var hand = actualPlayer.hand;
     var x = 22;
@@ -261,6 +252,12 @@ function handoutCards() {
         cards.appendChild(card);
         x += 11.5;
     });
+}
+
+function clearHand() {
+    while (cards.firstChild) {
+        cards.removeChild(cards.firstChild);
+    }
 }
 
 function updatePlayedCards(playedCard) {
@@ -308,28 +305,19 @@ function showChooseTrumpModal() {
 
 var setTrickCall = function () {
     if (actualPlayer) {
-        actualPlayer.trickCall = this.value;
-        socket.emit('set-trick-call', actualPlayer);
+        socket.emit('set-trick-call', Number(this.value));
         $('#trick-calls').modal('hide');
     }
 };
 
 var setTrump = function () {
     var trump = this.alt;
-    var data = JSON.stringify({
-        roomId: roomId,
-        trump: trump
-    });
-
-    socket.emit('set-trump', data);
+    socket.emit('set-trump', trump);
     $('#choose-trump').modal('hide');
 };
 
 var playCard = function () {
-    socket.emit('play-card', JSON.stringify({
-        actualPlayer: actualPlayer,
-        playedCard: this.id
-    }));
+    socket.emit('play-card', this.id);
 };
 
 //#endregion player functions

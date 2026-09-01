@@ -51,6 +51,10 @@ function draw(deck, amount, hand) {
 
 function checkPlayedCardFromPlayer(playedCards, actualCard, playersHand, trump) {
 
+    if (!actualCard || playedCards.length === 0) {
+        return false;
+    }
+
     let firstCard = playedCards[0];
     // fetch highest card
     let highestCard = getHighestCard(playedCards, trump);
@@ -77,6 +81,7 @@ function checkPlayedCardFromPlayer(playedCards, actualCard, playersHand, trump) 
             if (higherCardsTrumpColor.length > 0) { // players hand contains a higher card than highest card played
                 return higherCardsTrumpColor.indexOf(actualCard) >= 0;
             }
+            return actualPlayerTrumpCards.indexOf(actualCard) >= 0;
         } else {
             // player cannot follow any rule
             return true;

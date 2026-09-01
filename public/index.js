@@ -12,44 +12,53 @@ window.onload = function () {
 //#region lobby functions
 function addRoom() {
     var roomName = document.getElementById('room-name');
-    if (roomName.value === '') {
+    if (roomName.value.trim() === '') {
         alert('Room name must not be empty!');
         return;
     }
-    socket.emit('add-room', roomName.value);
+    socket.emit('add-room', roomName.value.trim());
 
     roomName.value = '';
     roomName.focus();
 }
 
 function updateRoomList(rooms) {
-    var html = '';
-    var badgeClass = '';
-    var disabled = '';
-    var hrefAttr = '';
-    // iterate through room and create <a> tag with badges, disable anchor tag if max players reached
+    var roomList = document.getElementById('availableRooms');
+    roomList.textContent = '';
+
     rooms.forEach(room => {
+        var roomLink = document.createElement('a');
+        var badge = document.createElement('span');
+
+        roomLink.id = room.id;
+        roomLink.className = 'list-group-item list-group-item-action d-flex justify-content-between align-items-center';
+        roomLink.appendChild(document.createTextNode(room.name));
+
+        badge.className = 'badge ' + (room.availableSeats ? 'badge-success' : 'badge-danger');
+        badge.textContent = room.amountOfPlayers + '/4 Players';
+        roomLink.appendChild(badge);
+
         if (!room.availableSeats) {
-            badgeClass = 'badge-danger';
-            disabled = 'disabled';
-            hrefAttr = '';
+            roomLink.classList.add('disabled');
         } else {
-            badgeClass = 'badge-success';
-            disabled = '';
-            hrefAttr = ' href="javascript:joinRoom(' + room.id + ');"';
+            roomLink.href = '#';
+            roomLink.addEventListener('click', function (event) {
+                event.preventDefault();
+                joinRoom(room.id);
+            });
         }
-        // with href attribute register click listener
-        html += '<a id="' + room.id + '" ' + hrefAttr + ' class="list-group-item list-group-item-action d-flex justify-content-between align-items-center ' + disabled + '">' + room.name + '<span class="badge ' + badgeClass + '">' + room.amountOfPlayers + '/4 Players</span></a>';
-
+        roomList.appendChild(roomLink);
     });
-
-    document.getElementById('availableRooms').innerHTML = html;
 }
 
 function joinRoom(id) {
-    // function redirects to right rooom
-    var username = document.getElementById('username').value;
-    var url = './room.html?id=' + id + '&username=' + username;
+    var username = document.getElementById('username').value.trim();
+    if (username === '') {
+        alert('Username must not be empty!');
+        return;
+    }
+    var query = new URLSearchParams({ id: id, username: username });
+    var url = './room.html?' + query.toString();
  
     window.location.href = url; 
 }
