@@ -1,356 +1,420 @@
-//#region initial setup
-const port = 3000;
-var express = require('express');
-var app = express();
+const path = require('path');
+const express = require('express');
+const http = require('http');
+const { Server } = require('socket.io');
+const Room = require('./Room').Room;
+const game = require('./Deck');
 
-// create a express app
-app.use(express.static('public'));
-var server = require('http').createServer(app).listen(port, function () {
-    console.log('listening on port ' + 3000);
-});
+const DEFAULT_PORT = Number(process.env.PORT) || 3000;
+const VALID_TRUMPS = new Set(['herz', 'eichel', 'pik', 'schelle']);
+const VALID_TRICK_CALLS = new Set([0, 2, 3, 4, 5, 6]);
 
-var io = require('socket.io').listen(server);
+function createGameServer() {
+    const app = express();
+    app.use(express.static(path.join(__dirname, 'public')));
 
-// two different namespaces, io var gets identified with underscore
-var _lobby = io.of('/lobby');
-var _room = io.of('/room');
+    const server = http.createServer(app);
+    const io = new Server(server);
+    const lobby = io.of('/lobby');
+    const roomNamespace = io.of('/room');
+    const rooms = [new Room(0, 'Testroom')];
 
-//#endregion initial setup
+    function publicPlayer(currentPlayer) {
+        return {
+            name: currentPlayer.name,
+            order: currentPlayer.order,
+            points: currentPlayer.points,
+            ready: currentPlayer.ready,
+            trickCall: currentPlayer.trickCall,
+            trickCalls: currentPlayer.trickCalls
+        };
+    }
 
-//#region variables
-
-let rooms = [];
-let room = require('./Room');
-let game = require('./Deck');
-
-rooms.push(new room.Room(rooms.length, 'Testroom')); // demo data
-
-//#endregion variables
-
-//#region lobby socket
-_lobby.on('connection', function (socket) {
-
-    // send rooms to connected client
-    unicastRoomList(socket, rooms);
-
-    // add new room
-    socket.on('add-room', function (data) {
-        rooms.push(new room.Room(rooms.length, data));
-        // broadcast room to all clients
-        broadcastRoomList(rooms);
-    });
-
-});
-//#endregion lobby socket
-
-//#region room socket
-_room.on('connection', function (socket) {
-
-    // player joins specific room
-    socket.on('join-room', function (playerData) {
-        var roomId = JSON.parse(playerData).roomId;
-        var username = JSON.parse(playerData).username;
-
-        socketJoinsRoom(socket, roomId, username);
-
-    });
-
-    socket.on('disconnect', function () {
-        // get room id of disconnected socked
-        let roomId;
-        rooms.forEach(room => {
-            room.players.forEach(player => {
-                if (player.socketId === socket.id) {
-                    roomId = player.roomId;
-                }
-            });
+    function privatePlayer(currentPlayer) {
+        return Object.assign(publicPlayer(currentPlayer), {
+            hand: currentPlayer.hand
         });
-        // remove player
-        if (roomId) {
-            rooms[roomId].removePlayer(socket.id);
+    }
 
-            broadcastRoomList(rooms);
-            updateRoomPlayersList(rooms[roomId]);
+    function publicRoom(room) {
+        return {
+            id: room.id,
+            name: room.name,
+            amountOfPlayers: room.amountOfPlayers,
+            availableSeats: room.availableSeats,
+            phase: room.phase,
+            players: room.players.map(publicPlayer),
+            round: room.round,
+            trump: room.trump,
+            turnNo: room.turnNo
+        };
+    }
+
+    function lobbyRoom(room) {
+        return {
+            id: room.id,
+            name: room.name,
+            amountOfPlayers: room.amountOfPlayers,
+            availableSeats: room.availableSeats
+        };
+    }
+
+    function sendRoomList(socket) {
+        socket.emit('update-room-list', rooms.map(lobbyRoom));
+    }
+
+    function broadcastRoomList() {
+        lobby.emit('update-room-list', rooms.map(lobbyRoom));
+    }
+
+    function emitRoom(room, event, data) {
+        roomNamespace.to(String(room.id)).emit(event, data);
+    }
+
+    function updateRoomPlayersList(room) {
+        emitRoom(room, 'update-player-list', publicRoom(room));
+    }
+
+    function updatePlayersPointsList(room) {
+        emitRoom(room, 'update-points', publicRoom(room));
+    }
+
+    function broadcastTrickCalls(room) {
+        emitRoom(room, 'player-trick-calls', room.players.map(publicPlayer));
+    }
+
+    function displayTrump(room) {
+        emitRoom(room, 'display-trump', room.trump);
+    }
+
+    function rejectEvent(socket, event, message, acknowledge) {
+        socket.emit('game-error', { event: event, message: message });
+        if (typeof acknowledge === 'function') {
+            acknowledge({ ok: false, error: message });
         }
-    });
+    }
 
-    socket.on('force-disconnect', function (roomId) {
-
-        rooms[roomId].removePlayer(socket.id);
-
-        broadcastRoomList(rooms);
-        updateRoomPlayersList(rooms[roomId]);
-
-    });
-
-    socket.on('set-ready', function (roomId) {
-        // check if everyone is ready
-        var everyoneReady = false;
-        everyoneReady = rooms[roomId].setPlayerReady(socket.id);
-
-        // updates player list in room
-        updateRoomPlayersList(rooms[roomId]);
-
-        if (everyoneReady) {
-            // if everyone is ready, start round (shuffle deck, handout cards, ...);
-            startRound(roomId);
+    function acceptEvent(acknowledge, data) {
+        if (typeof acknowledge === 'function') {
+            acknowledge(Object.assign({ ok: true }, data));
         }
-    });
+    }
 
-    socket.on('set-trick-call', function (player) {
-        let actualRoom = rooms[player.roomId];
-        actualRoom.setTrickCall(player.socketId, Number(player.trickCall)); // otherwise trickCall would be string
+    function getSocketRoom(socket) {
+        const roomId = socket.data.roomId;
+        if (!Number.isInteger(roomId)) {
+            return undefined;
+        }
+        return rooms[roomId];
+    }
 
-        // if players trick call is not NONE - 0, disabled trick for all other players
-        if (player.trickCall > 0) {
-            _room.in(player.roomId).emit('disable-trick-button', player.trickCall);
-            //socket.broadcast.emit('disable-trick-button', player.trickCall);
+    function getSocketPlayer(socket, room) {
+        return room && room.getPlayer(socket.id);
+    }
+
+    function startRound(room) {
+        room.round++;
+        room.deck = game.createDeck();
+        room.trump = '';
+        room.phase = 'bidding';
+        room.biddingTurnNo = 1;
+        room.winningBidderSocketId = null;
+        room.turnNo = 0;
+
+        if (room.round === 1) {
+            room.setRandomOrder();
+            room.players.sort(compareByOrder);
         }
 
-        let nextPlayer = actualRoom.getNextPlayer(player.order);
-        // give everyone the chance to set trick calls
-        if (nextPlayer) {
-            let nextSocket = _room.connected[nextPlayer.socketId];
+        emitRoom(room, 'enable-trick-button');
+        displayTrump(room);
+        updatePlayersPointsList(room);
 
-            // if player is last player in order, check if anyone has called a trick, if not,
-            // last player has to call a trick so disable 0 - NONE button
-            if (nextPlayer.order === 4 && actualRoom.players.filter(x => x.trickCall > 0).length === 0) {
-                nextSocket.emit('disable-trick-button', 0);
+        room.players.forEach(currentPlayer => {
+            const playerSocket = roomNamespace.sockets.get(currentPlayer.socketId);
+            currentPlayer.hand = game.draw(room.deck, 5, currentPlayer.hand);
+            if (playerSocket) {
+                playerSocket.emit('start-round', privatePlayer(currentPlayer));
+            }
+        });
+    }
+
+    function finishTrick(room) {
+        const winningPlayer = game.getPlayerIdxWithHighestCard(room.playedCards, room.trump);
+        winningPlayer.trickCalls++;
+        room.turnNo = winningPlayer.order;
+        updateRoomPlayersList(room);
+
+        const roundComplete = room.players.every(currentPlayer => currentPlayer.hand.length === 0);
+        room.playedCards.clear();
+        broadcastTrickCalls(room);
+
+        setTimeout(() => {
+            emitRoom(room, 'update-played-cards', undefined);
+        }, 1500);
+
+        if (!roundComplete) {
+            return;
+        }
+
+        room.players.forEach(currentPlayer => currentPlayer.registerPoints(room.trump));
+        updatePlayersPointsList(room);
+
+        if (room.isGameOver()) {
+            emitRoom(room, 'game-over');
+            room.resetGameData();
+            return;
+        }
+
+        startRound(room);
+    }
+
+    function registerPlayedCard(socket, room, currentPlayer, cardId, acknowledge) {
+        if (room.phase !== 'playing') {
+            rejectEvent(socket, 'play-card', 'Cards can only be played during a trick.', acknowledge);
+            return;
+        }
+        if (room.turnNo !== currentPlayer.order) {
+            rejectEvent(socket, 'play-card', 'It is not your turn.', acknowledge);
+            return;
+        }
+        if (typeof cardId !== 'string') {
+            rejectEvent(socket, 'play-card', 'Invalid card.', acknowledge);
+            return;
+        }
+
+        const actualCard = currentPlayer.hand.find(card => card.id === cardId);
+        if (!actualCard) {
+            rejectEvent(socket, 'play-card', 'The selected card is not in your hand.', acknowledge);
+            return;
+        }
+
+        const playedCards = Array.from(room.playedCards.values());
+        if (playedCards.length > 0 &&
+            !game.checkPlayedCardFromPlayer(playedCards, actualCard, currentPlayer.hand, room.trump)) {
+            rejectEvent(socket, 'play-card', 'The selected card does not follow the game rules.', acknowledge);
+            return;
+        }
+
+        room.playedCards.set(currentPlayer, actualCard);
+        room.setTurnNo();
+        currentPlayer.removeCardFromHand(cardId);
+
+        updateRoomPlayersList(room);
+        socket.emit('update-cards', privatePlayer(currentPlayer));
+        emitRoom(room, 'update-played-cards', actualCard);
+        acceptEvent(acknowledge);
+
+        if (room.playedCards.size === room.amountOfPlayers) {
+            finishTrick(room);
+        }
+    }
+
+    function removeSocketPlayer(socket) {
+        const room = getSocketRoom(socket);
+        if (!room) {
+            return;
+        }
+
+        const gameWasActive = room.phase !== 'waiting';
+        room.removePlayer(socket.id);
+        delete socket.data.roomId;
+
+        if (gameWasActive) {
+            room.resetGameData();
+            emitRoom(room, 'game-aborted', 'A player disconnected. The game was reset.');
+            displayTrump(room);
+            broadcastTrickCalls(room);
+            updatePlayersPointsList(room);
+        }
+
+        broadcastRoomList();
+        updateRoomPlayersList(room);
+    }
+
+    lobby.on('connection', socket => {
+        sendRoomList(socket);
+
+        socket.on('add-room', (name, acknowledge) => {
+            const roomName = typeof name === 'string' ? name.trim() : '';
+            if (roomName.length < 1 || roomName.length > 50) {
+                rejectEvent(socket, 'add-room', 'Room names must contain 1 to 50 characters.', acknowledge);
+                return;
             }
 
-            nextSocket.emit('show-trick-modal', nextPlayer);
-        } else {
-            // everyone sets their trick calls
+            rooms.push(new Room(rooms.length, roomName));
+            broadcastRoomList();
+            acceptEvent(acknowledge, { roomId: rooms.length - 1 });
+        });
+    });
 
-            // now let player with highest trick call choose the trump
-            let nextSocketId = actualRoom.getSocketIdWithHighestTrickCall();
-
-            // broadcast trick calls
-            broadcastTrickCalls(actualRoom);
-
-            let nextSocket = _room.connected[nextSocketId];
-            nextPlayer = actualRoom.getPlayer(nextSocketId);
-            if (nextSocket) {
-                actualRoom.turnNo = nextPlayer.order;
-                nextSocket.emit('choose-trump', nextPlayer);
+    roomNamespace.on('connection', socket => {
+        socket.on('join-room', (data, acknowledge) => {
+            if (!data || typeof data !== 'object') {
+                rejectEvent(socket, 'join-room', 'Invalid join request.', acknowledge);
+                return;
             }
-        }
-    });
+            if (Number.isInteger(socket.data.roomId)) {
+                rejectEvent(socket, 'join-room', 'This connection already joined a room.', acknowledge);
+                return;
+            }
 
-    socket.on('set-trump', function (message) {
-        // message contains roomId and trump
-        var data = JSON.parse(message);
-        let actualRoom = rooms[data.roomId];
-        actualRoom.trump = data.trump;
+            const roomId = Number(data.roomId);
+            const username = typeof data.username === 'string' ? data.username.trim() : '';
+            const selectedRoom = Number.isInteger(roomId) ? rooms[roomId] : undefined;
+            if (!selectedRoom) {
+                rejectEvent(socket, 'join-room', 'The selected room does not exist.', acknowledge);
+                return;
+            }
+            if (username.length < 1 || username.length > 30) {
+                rejectEvent(socket, 'join-room', 'Usernames must contain 1 to 30 characters.', acknowledge);
+                return;
+            }
+            if (!selectedRoom.addPlayer(socket.id, roomId, username)) {
+                rejectEvent(socket, 'join-room', 'The selected room is full.', acknowledge);
+                return;
+            }
 
-        // weli gets trump as color
-        actualRoom.setWeliAsTrump(data.trump);
+            socket.data.roomId = roomId;
+            socket.join(String(roomId));
+            socket.emit('room-data', {
+                id: selectedRoom.id,
+                name: selectedRoom.name
+            });
+            updateRoomPlayersList(selectedRoom);
+            broadcastRoomList();
+            acceptEvent(acknowledge);
+        });
 
-        // increases trump cards rank with 10
-        actualRoom.increaseTrumpRank(data.trump);
+        socket.on('disconnect', () => {
+            removeSocketPlayer(socket);
+        });
 
-        // shows trump on table
-        displayTrump(actualRoom);
+        socket.on('set-ready', acknowledge => {
+            const selectedRoom = getSocketRoom(socket);
+            const currentPlayer = getSocketPlayer(socket, selectedRoom);
+            if (!currentPlayer || selectedRoom.phase !== 'waiting') {
+                rejectEvent(socket, 'set-ready', 'You cannot become ready right now.', acknowledge);
+                return;
+            }
 
-    });
+            const everyoneReady = selectedRoom.setPlayerReady(socket.id);
+            updateRoomPlayersList(selectedRoom);
+            acceptEvent(acknowledge);
+            if (everyoneReady) {
+                startRound(selectedRoom);
+            }
+        });
 
-    socket.on('play-card', function (message) {
-        var player = JSON.parse(message).actualPlayer;
-        var cardId = JSON.parse(message).playedCard;
-        var actualRoom = rooms[player.roomId];
+        socket.on('set-trick-call', (trickCall, acknowledge) => {
+            const selectedRoom = getSocketRoom(socket);
+            const currentPlayer = getSocketPlayer(socket, selectedRoom);
+            const numericCall = Number(trickCall);
+            if (!currentPlayer || selectedRoom.phase !== 'bidding' ||
+                currentPlayer.order !== selectedRoom.biddingTurnNo) {
+                rejectEvent(socket, 'set-trick-call', 'It is not your turn to bid.', acknowledge);
+                return;
+            }
+            if (!VALID_TRICK_CALLS.has(numericCall)) {
+                rejectEvent(socket, 'set-trick-call', 'Invalid trick call.', acknowledge);
+                return;
+            }
 
-        registerPlayedCard(socket, actualRoom, player, cardId);
+            const highestCall = Math.max(0, ...selectedRoom.players.map(player => player.trickCall));
+            if ((numericCall > 0 && numericCall <= highestCall) ||
+                (currentPlayer.order === selectedRoom.amountOfPlayers && highestCall === 0 && numericCall === 0)) {
+                rejectEvent(socket, 'set-trick-call', 'The trick call must exceed the current bid.', acknowledge);
+                return;
+            }
 
-    });
+            selectedRoom.setTrickCall(socket.id, numericCall);
+            if (numericCall > 0) {
+                emitRoom(selectedRoom, 'disable-trick-button', numericCall);
+            }
 
-});
-
-//#endregion room socket
-
-//#region lobby helper functions
-
-function unicastRoomList(socket, rooms) {
-    if (rooms.length > 0) {
-        socket.emit('update-room-list', rooms);
-    }
-}
-
-function broadcastRoomList(rooms) {
-    _lobby.emit('update-room-list', rooms);
-}
-
-//#endregion lobby helper functions
-
-
-//#region room helper functions
-
-function updateRoomPlayersList(room) {
-    _room.in(room.id).emit('update-player-list', room);
-}
-
-function updatePlayersPointsList(room) {
-    _room.in(room.id).emit('update-points', room);
-}
-
-function updateRoomHeaderData(room) {
-    // send information about current room to client
-    _room.in(room.id).emit('room-data', room);
-}
-
-function socketJoinsRoom(socket, roomId, username) {
-
-    // join socket room
-    socket.join(roomId);
-
-    // add player and update room
-    rooms[roomId].addPlayer(socket.id, roomId, username);
-
-    updateRoomHeaderData(rooms[roomId]);
-
-    // broadcast room (with updated players) to all clients in lobby
-    broadcastRoomList(rooms);
-}
-
-function startRound(roomId) {
-    let actualRoom = rooms[roomId];
-    actualRoom.round++;
-    actualRoom.deck = game.createDeck(); // creates and shuffles deck
-
-    // everyone gets a random order number in first round
-    if (actualRoom.round === 1) {
-        actualRoom.setRandomOrder();
-        actualRoom.players.sort(compareByOrder);
-    }
-
-    // activate trick call btn again
-    enableTrickCallButtons(rooms[roomId]);
-
-    updatePlayersPointsList(actualRoom);
-
-    // hand out 5 cards to every player
-    actualRoom.players.forEach(player => {
-        let socket = _room.connected[player.socketId];
-        player.hand = game.draw(actualRoom.deck, 5, player.hand); // player.hand
-        if (socket) {
-            // sending cards to every client in room
-            socket.emit('start-round', player);
-        }
-    });
-
-}
-
-function registerPlayedCard(socket, actualRoom, actPlayer, cardId) {
-    // return false if it is not players turn
-    if (actualRoom.turnNo !== actPlayer.order) {
-        return false;
-    }
-
-    let player = actualRoom.players.filter(player => player.socketId === actPlayer.socketId)[0];
-    let validTurn = false;
-    // extracts played cards from map in room
-    let playedCardsInRound = Array.from(actualRoom.playedCards.values());
-    let actualCard = player.hand.filter(card => card.id === cardId)[0];
-
-    // first played card in round has to follow no rules
-    if (playedCardsInRound.length >= 1) {
-        // check if player played the right card
-        // there are some rules about "follow the suite" and "follow the value" 
-        validTurn = game.checkPlayedCardFromPlayer(playedCardsInRound, actualCard, player.hand, actualRoom.trump);
-    }
-
-    // register turn in player object
-    if (validTurn || playedCardsInRound.length === 0) {
-        actualRoom.playedCards.set(player, actualCard); // mapping between player and card
-        actualRoom.setTurnNo(); // next players turn
-
-        actualRoom.players.find(p => p.socketId === player.socketId).removeCardFromHand(cardId);
-
-        // updates player list in room
-        updateRoomPlayersList(rooms[player.roomId]);
-
-        socket.emit('update-cards', actualRoom.players.find(p => p.socketId === player.socketId));
-        updatePlayedCards(actualRoom.id, actualCard);
-    }
-
-    // when everybody played a card do the following
-    // - register trick of player with highest card
-    // - set turnNo to player with highest card
-    if (actualRoom.playedCards.size === 4) {
-        // increase trick calls of player
-        let tmpPlayer = game.getPlayerIdxWithHighestCard(actualRoom.playedCards, actualRoom.trump);
-        let player = actualRoom.players.find(p => p.socketId === tmpPlayer.socketId);
-        if (player) {
-            player.trickCalls++;
-
-            // set order no
-            actualRoom.turnNo = player.order;
-            updateRoomPlayersList(actualRoom);
-
-            // if hand is empty, register points and startNewRound
-            if (player.hand.length === 0) {
-                for (let i = 0; i < actualRoom.players.length; i++) {
-                    actualRoom.players[i].registerPoints(actualRoom.trump);
-                }
-
-                broadcastTrickCalls(actualRoom);
-                // delete playedCards map
-                actualRoom.playedCards.clear();
-
-                // clear played cards after 2 seconds
-                setTimeout(() => {
-                    updatePlayedCards(actualRoom.id, undefined);
-                }, 1500);
-
-                // someone reaches 0 or 100 points)
-                if (actualRoom.isGameOver()) {
-                    actualRoom.resetGameData();
-
-                    // clear trump
-                    displayTrump(actualRoom);
-                    // clear trick calls
-                    broadcastTrickCalls(actualRoom);
-
-                    updatePlayersPointsList(actualRoom);
-
-                    _room.in(actualRoom.id).emit('game-over');
-
-                } else {
-                    // start next round
-                    startRound(actualRoom.id);
+            selectedRoom.biddingTurnNo++;
+            const nextPlayer = selectedRoom.players.find(
+                player => player.order === selectedRoom.biddingTurnNo
+            );
+            if (nextPlayer) {
+                const nextSocket = roomNamespace.sockets.get(nextPlayer.socketId);
+                if (nextSocket) {
+                    if (nextPlayer.order === selectedRoom.amountOfPlayers &&
+                        selectedRoom.players.every(player => player.trickCall === 0)) {
+                        nextSocket.emit('disable-trick-button', 0);
+                    }
+                    nextSocket.emit('show-trick-modal', privatePlayer(nextPlayer));
                 }
             } else {
-                // delete playedCards map
-                actualRoom.playedCards.clear();
-                broadcastTrickCalls(actualRoom);
+                const winningSocketId = selectedRoom.getSocketIdWithHighestTrickCall();
+                const winningPlayer = selectedRoom.getPlayer(winningSocketId);
+                selectedRoom.phase = 'choosing-trump';
+                selectedRoom.winningBidderSocketId = winningSocketId;
+                selectedRoom.turnNo = winningPlayer.order;
+                broadcastTrickCalls(selectedRoom);
 
-                // clear played cards
-                setTimeout(() => {
-                    updatePlayedCards(actualRoom.id, undefined);
-                }, 1500);
+                const winningSocket = roomNamespace.sockets.get(winningSocketId);
+                if (winningSocket) {
+                    winningSocket.emit('choose-trump', privatePlayer(winningPlayer));
+                }
+            }
+            acceptEvent(acknowledge);
+        });
+
+        socket.on('set-trump', (trump, acknowledge) => {
+            const selectedRoom = getSocketRoom(socket);
+            if (!selectedRoom || selectedRoom.phase !== 'choosing-trump' ||
+                selectedRoom.winningBidderSocketId !== socket.id) {
+                rejectEvent(socket, 'set-trump', 'You cannot choose trump right now.', acknowledge);
+                return;
+            }
+            if (!VALID_TRUMPS.has(trump)) {
+                rejectEvent(socket, 'set-trump', 'Invalid trump color.', acknowledge);
+                return;
             }
 
-        }
-    }
-}
+            selectedRoom.trump = trump;
+            selectedRoom.setWeliAsTrump(trump);
+            selectedRoom.increaseTrumpRank(trump);
+            selectedRoom.phase = 'playing';
+            displayTrump(selectedRoom);
+            acceptEvent(acknowledge);
+        });
 
-function updatePlayedCards(roomId, actualCard) {
-    _room.in(roomId).emit('update-played-cards', actualCard);
-}
+        socket.on('play-card', (cardId, acknowledge) => {
+            const selectedRoom = getSocketRoom(socket);
+            const currentPlayer = getSocketPlayer(socket, selectedRoom);
+            if (!currentPlayer) {
+                rejectEvent(socket, 'play-card', 'You have not joined this room.', acknowledge);
+                return;
+            }
+            registerPlayedCard(socket, selectedRoom, currentPlayer, cardId, acknowledge);
+        });
+    });
 
-function enableTrickCallButtons(room) {
-    _room.in(room.id).emit('enable-trick-button'); 
-}
-
-function displayTrump(room) {
-    _room.in(room.id).emit('display-trump', room.trump);
-}
-
-function broadcastTrickCalls(room) {
-    _room.in(room.id).emit('player-trick-calls', room.players);
+    return {
+        app: app,
+        io: io,
+        rooms: rooms,
+        server: server,
+        start: port => new Promise(resolve => {
+            server.listen(port, () => resolve(server.address()));
+        }),
+        stop: () => new Promise(resolve => {
+            io.close(() => resolve());
+        })
+    };
 }
 
 function compareByOrder(player1, player2) {
     return player1.order - player2.order;
 }
 
-//#endregion room helper functions
+if (require.main === module) {
+    const gameServer = createGameServer();
+    gameServer.start(DEFAULT_PORT).then(() => {
+        console.log('listening on port ' + DEFAULT_PORT);
+    });
+}
+
+exports.createGameServer = createGameServer;
